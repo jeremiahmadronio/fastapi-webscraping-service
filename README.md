@@ -48,7 +48,7 @@ POST /api/scrape-new-pdf
 
 **Headers:**
 ```
-X-Internal-Secret: <YOUR_API_KEY> 
+X-Internal-Secret: Jeremiah_Madronio_API_Key_82219800JeremiahPux83147
 Content-Type: application/json
 ```
 
