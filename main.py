@@ -530,3 +530,19 @@ async def extract_manual_pdf(file: UploadFile = File(...)):
 def root():
     """Health check endpoint"""
     return {"message": "Smart DA Price Scraper is Running"}
+
+
+
+# ==============================================================================
+# RAILWAY DEPLOYMENT CONFIGURATION
+# ==============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+
+    # Get port from environment variable (Railway sets this automatically)
+    port = int(os.environ.get("PORT", 8000))
+
+    # Run the FastAPI app
+    uvicorn.run(app, host="0.0.0.0", port=port)
