@@ -1,13 +1,13 @@
 # ==============================================================================
-# DA PRICE INDEX SCRAPER - RULE-BASED PARSER WITH MULTI-LINE BUFFERING
+# DA PRICE INDEX SCRAPER - IMPROVED RULE-BASED PARSER
 # ==============================================================================
 #
-# Purpose: Scrapes and parses Daily Price Index PDFs from DA Philippines website
-# Features:
-#   - Smart multi-line buffering for commodity names
-#   - Brand prioritization for cooking oils
-#   - Automatic date detection from PDF filenames
-#   - Market extraction and structured data output
+# Key Improvements:
+#   1. Better multi-line commodity detection using lookahead
+#   2. Smarter unit extraction from specification column
+#   3. More robust brand and noise word removal
+#   4. Better handling of parenthetical descriptions
+#   5. Improved price detection to avoid false matches
 #
 # ==============================================================================
 
@@ -33,11 +33,11 @@ TARGET_URL = "https://www.da.gov.ph/price-monitoring/"
 SHARED_SECRET = "Jeremiah_Madronio_API_Key_82219800JeremiahPux83147"
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
 }
 
 # ==============================================================================
-# DATA MODELS (DTOs)
+# DATA MODELS
 # ==============================================================================
 
 class PriceRow(BaseModel):
@@ -45,7 +45,7 @@ class PriceRow(BaseModel):
     category: str = Field(..., description="Clean category name")
     commodity: str = Field(..., description="Normalized commodity name")
     origin: Optional[str] = Field(None, description="Local or Imported")
-    unit: Optional[str] = Field(None, description="kg, pc, L, ml, bottle")
+    unit: str = Field("kg", description="kg, pc, L, ml")
     price: Optional[float] = Field(None, description="Price per unit")
 
 class PdfResponseStructured(BaseModel):
@@ -61,14 +61,13 @@ class ScrapeRequest(BaseModel):
     target_url: str = Field(TARGET_URL)
 
 # ==============================================================================
-# APP INITIALIZATION & SECURITY
+# APP INITIALIZATION
 # ==============================================================================
 
-app = FastAPI(title="DA Price Index Scraper (Buffered)", version="5.3.0")
+app = FastAPI(title="DA Price Index Scraper (Improved)", version="6.0.0")
 api_key_header = APIKeyHeader(name="X-Internal-Secret", auto_error=False)
 
 def verify_internal_access(x_internal_secret: str = Depends(api_key_header)):
-    """Validates API key for all protected endpoints"""
     if x_internal_secret == SHARED_SECRET:
         return True
     raise HTTPException(status_code=401, detail="Unauthorized")
@@ -76,7 +75,6 @@ def verify_internal_access(x_internal_secret: str = Depends(api_key_header)):
 # ==============================================================================
 # CATEGORY DEFINITIONS
 # ==============================================================================
-# Known categories from DA Price Index PDFs - used for accurate categorization
 
 KNOWN_CATEGORIES = [
     "IMPORTED COMMERCIAL RICE", "LOCAL COMMERCIAL RICE", "CORN PRODUCTS",
@@ -87,19 +85,11 @@ KNOWN_CATEGORIES = [
 ]
 
 # ==============================================================================
-# PDF EXTRACTION UTILITIES
+# UTILITY FUNCTIONS
 # ==============================================================================
 
 def extract_pdf_content(pdf_bytes: bytes) -> str:
-    """
-    Extracts raw text from PDF file
-
-    Args:
-        pdf_bytes: PDF file as bytes
-
-    Returns:
-        Combined text from all pages
-    """
+    """Extracts raw text from PDF"""
     pdf_file = BytesIO(pdf_bytes)
     reader = PdfReader(pdf_file)
     text = ""
@@ -110,178 +100,392 @@ def extract_pdf_content(pdf_bytes: bytes) -> str:
     return text
 
 def parse_date_from_filename(filename: str) -> Optional[datetime]:
-    """
-    Extracts date from PDF filename (e.g., "January-15-2024.pdf")
-
-    Args:
-        filename: PDF filename string
-
-    Returns:
-        datetime object if date found, None otherwise
-    """
+    """Extracts date from filename like 'December-10-2025-DPI-AFC.pdf'"""
     match = re.search(r"([A-Za-z]+-\d{1,2}-\d{4})", filename)
     if not match:
         return None
 
     date_str = match.group(1)
-
-    # Try different date formats (with/without leading zero)
     for fmt in ["%B-%d-%Y", "%b-%d-%Y", "%B-%#d-%Y", "%b-%#d-%Y"]:
         try:
             return datetime.strptime(date_str, fmt)
         except ValueError:
             continue
-
     return None
 
 # ==============================================================================
-# COMMODITY NORMALIZATION LOGIC
+# UNIT EXTRACTION
 # ==============================================================================
 
-def normalize_oil_data(full_text: str) -> tuple[str, str]:
+def extract_unit_from_spec(spec_text: str, commodity_name: str) -> str:
     """
-    Smart parser for cooking oil with brand prioritization
-
-    Priority Order: Jolly > Minola > Spring > Generic (Palm/Coconut)
-    This ensures branded oils don't get merged with generic types
-
-    Args:
-        full_text: Raw text containing oil description
-
-    Returns:
-        tuple: (clean_name, unit)
-        Example: ("Cooking Oil (Jolly)", "1 L")
+    Extracts unit from specification column
+    Returns: 'kg', 'pc', 'L', or 'ml'
     """
-    upper = full_text.upper()
+    upper_spec = spec_text.upper()
+    upper_name = commodity_name.upper()
 
-    # Step 1: Identify Brand/Type (Brands have priority!)
-    oil_type = "Generic"
+    # Chicken eggs are always per piece
+    if "EGG" in upper_name and "CHICKEN" in upper_name:
+        return "pc"
 
-    if "MINOLA" in upper:
-        oil_type = "Minola"
-    elif "SPRING" in upper:
-        oil_type = "Spring"
-    elif "JOLLY" in upper:
-        oil_type = "Jolly"
-    elif "PALM" in upper:
-        oil_type = "Palm"
-    elif "COCONUT" in upper:
-        oil_type = "Coconut"
+    # Cooking oils - check for volume
+    if "COOKING OIL" in upper_name:
+        if "350" in upper_spec and "ML" in upper_spec:
+            return "350 ml"
+        if "500" in upper_spec and "ML" in upper_spec:
+            return "500 ml"
+        if "1" in upper_spec and ("LITER" in upper_spec or "L" in upper_spec):
+            return "1 L"
+        return "L"
 
-    # Step 2: Identify Volume/Unit
-    unit = "L"  # Default
+    # Default for everything else
+    return "kg"
 
-    if "350" in upper:
-        unit = "350 ml"
-    elif "500" in upper:
-        unit = "500 ml"
-    elif "1,000" in upper or "1000" in upper or "1 LITER" in upper or "1L" in upper:
-        unit = "1 L"
+# ==============================================================================
+# COMMODITY NORMALIZATION
+# ==============================================================================
 
-    # Step 3: Build clean name
-    clean_name = f"Cooking Oil ({oil_type})" if oil_type != "Generic" else "Cooking Oil"
-
-    return clean_name, unit
-
-def normalize_commodity_name(full_text: str, category: str) -> tuple[str, Optional[str]]:
+def normalize_commodity_name(commodity_text: str, category: str) -> tuple[str, Optional[str]]:
     """
-    Main commodity name normalizer - handles multi-line names and special cases
-
-    This function:
-    1. Cleans garbage characters and extra spaces
-    2. Applies category-specific rules (rice, vegetables, meat, etc.)
-    3. Removes brand names, units, and noise words
-    4. Returns standardized commodity name + unit override if applicable
-
-    Args:
-        full_text: Complete concatenated text (may include multiple lines)
-        category: Current category context
-
-    Returns:
-        tuple: (clean_commodity_name, unit_override)
+    Main normalization function
+    Returns: (clean_name, specification)
     """
-    # Clean control characters and normalize spacing
-    text_clean = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', full_text)
-    text_clean = " ".join(text_clean.split())
+    # Clean control characters
+    text = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', commodity_text)
+    text = " ".join(text.split())
 
+    upper_text = text.upper()
     upper_cat = category.upper()
-    upper_name = text_clean.upper()
 
     # -------------------------------------------------------------------------
-    # SPECIAL HANDLERS FOR SPECIFIC COMMODITIES
+    # RICE PRODUCTS
     # -------------------------------------------------------------------------
-
-    # Cooking Oil - uses brand-aware parser
-    if "OTHER BASIC" in upper_cat and "COOKING OIL" in upper_name:
-        return normalize_oil_data(text_clean)
-
-    # -------------------------------------------------------------------------
-    # CATEGORY-SPECIFIC NORMALIZATION RULES
-    # -------------------------------------------------------------------------
-
-    unit_override = None
-
-    # Rice varieties
     if "RICE" in upper_cat:
-        if "SPECIAL" in upper_name: return "Special White Rice", "kg"
-        if "PREMIUM" in upper_name: return "Premium Rice", "kg"
-        if "WELL MILLED" in upper_name: return "Well Milled Rice", "kg"
-        if "REGULAR MILLED" in upper_name: return "Regular Milled Rice", "kg"
-        if "GLUTINOUS" in upper_name: return "Glutinous Rice", "kg"
-        if "JASPONICA" in upper_name or "JAPONICA" in upper_name: return "Jasponica Rice", "kg"
-
-    # Vegetables - differentiate by color/type
-    if "ONION" in upper_name:
-        if "RED" in upper_name: return "Red Onion", "kg"
-        if "WHITE" in upper_name: return "White Onion", "kg"
-
-    if "BELL PEPPER" in upper_name:
-        if "RED" in upper_name: return "Bell Pepper Red", "kg"
-        if "GREEN" in upper_name: return "Bell Pepper Green", "kg"
-
-    if "CHILLI" in upper_name or "SILING" in upper_name:
-        if "RED" in upper_name or "LABUYO" in upper_name or "TINGALA" in upper_name:
-            return "Chilli Red", "kg"
-        if "GREEN" in upper_name:
-            return "Chilli Green", "kg"
-
-    # Fish and Meat products
-    if "BANGUS" in upper_name: return "Bangus", "kg"
-    if "TILAPIA" in upper_name: return "Tilapia", "kg"
-    if "GALUNGGONG" in upper_name: return "Galunggong", "kg"
-    if "PORK BELLY" in upper_name: return "Pork Belly", "kg"
-    if "PORK CHOP" in upper_name: return "Pork Chop", "kg"
-    if "WHOLE CHICKEN" in upper_name: return "Whole Chicken", "kg"
-    if "EGG" in upper_name and "CHICKEN" in upper_name: return "Chicken Egg", "pc"
-    if "TAMBAKOL" in upper_name or "YELLOW-FIN" in upper_name:
-        return "Tambakol (Yellow-Fin Tuna)", "kg"
+        if "BASMATI" in upper_text:
+            return "Basmati Rice", None
+        if "GLUTINOUS" in upper_text:
+            return "Glutinous Rice", None
+        if "JASPONICA" in upper_text or "JAPONICA" in upper_text:
+            return "Jasponica Rice", None
+        if "SPECIAL" in upper_text and "WHITE" in upper_text:
+            return "Special White Rice", None
+        if "PREMIUM" in upper_text:
+            return "Premium Rice", "5% broken"
+        if "WELL MILLED" in upper_text:
+            return "Well Milled Rice", "1-19% bran streak"
+        if "REGULAR MILLED" in upper_text:
+            return "Regular Milled Rice", "20-40% bran streak"
 
     # -------------------------------------------------------------------------
-    # FALLBACK CLEANING FOR UNMATCHED COMMODITIES
+    # CORN PRODUCTS
     # -------------------------------------------------------------------------
+    if "CORN" in upper_cat:
+        if "WHITE" in upper_text and "COB" in upper_text:
+            return "Corn White", "Cob, Glutinous"
+        if "YELLOW" in upper_text and "COB" in upper_text:
+            return "Corn Yellow", "Cob, Sweet"
+        if "GRITS" in upper_text and "WHITE" in upper_text and "FOOD" in upper_text:
+            return "Corn Grits White", "Food Grade"
+        if "GRITS" in upper_text and "YELLOW" in upper_text and "FOOD" in upper_text:
+            return "Corn Grits Yellow", "Food Grade"
+        if "CRACKED" in upper_text:
+            return "Corn Cracked", "Feed Grade"
+        if "GRITS" in upper_text and "FEED" in upper_text:
+            return "Corn Grits", "Feed Grade"
 
-    name = text_clean
+    # -------------------------------------------------------------------------
+    # FISH PRODUCTS
+    # -------------------------------------------------------------------------
+    if "FISH" in upper_cat:
+        # Extract size specification
+        size_match = re.search(r'(Large|Medium|Small).*?(\d+-?\d*\s*pcs?/?kg)?', text, re.IGNORECASE)
+        size_spec = size_match.group(0) if size_match else None
 
-    # Remove brand names and common noise words
-    remove_words = [
-        "Magnolia", "Bounty Fresh", "Unbranded", "Fresh", "Fully Dressed",
-        "Jolly Brand", "Jolly", "Palm Olein", "Spring", "Minola", "Brand",
-        "Local", "Imported", "frozen", "chilled", "whole round", "medium", "large",
-        "suprema variety", "native"
-    ]
-    for word in remove_words:
-        name = re.sub(rf'\b{word}\b', '', name, flags=re.IGNORECASE)
+        if "ALUMAHAN" in upper_text or "MACKEREL" in upper_text and "INDIAN" in upper_text:
+            return "Alumahan (Indian Mackerel)", size_spec
+        if "BANGUS" in upper_text:
+            if "LARGE" in upper_text:
+                return "Bangus Large",size_spec
+            if "MEDIUM" in upper_text:
+                return "Bangus Medium",size_spec
+        if "BONITO" in upper_text:
+            return "Bonito (Frigate Tuna)",size_spec
+        if "GALUNGGONG" in upper_text:
+            return "Galunggong", "Medium (12-14 pcs/kg)"
+        if "MACKEREL" in upper_text and "INDIAN" not in upper_text:
+            return "Mackerel", None
+        if "PAMPANO" in upper_text:
+            return "Pampano", None
+        if "SALMON BELLY" in upper_text:
+            return "Salmon Belly", None
+        if "SALMON HEAD" in upper_text:
+            return "Salmon Head", None
+        if "SARDINES" in upper_text or "TAMBAN" in upper_text:
+            return "Sardines (Tamban)", None
+        if "SQUID" in upper_text or "PUSIT" in upper_text:
+            return "Squid", size_spec
+        if "TAMBAKOL" in upper_text or "YELLOW-FIN" in upper_text:
+            return "Tambakol (Yellow-Fin Tuna)", "Medium"
+        if "TILAPIA" in upper_text:
+            return "Tilapia", "Medium (5-6 pcs/kg)"
 
-    # Remove unit measurements embedded in text
-    name = re.sub(r'[\d,\.]+\s*[-]?\s*(ml|liter|l|kg|g|pc|bottle|bundles)[s]?', '', name, flags=re.IGNORECASE)
+    # -------------------------------------------------------------------------
+    # MEAT PRODUCTS (BEEF, PORK, POULTRY)
+    # -------------------------------------------------------------------------
+    if "BEEF" in upper_cat:
+        # Extract size/type specification if present
+        size_match = re.search(r'\b(Large|Medium|Small|Lean|Boneless|with Bones)\b', text, re.IGNORECASE)
+        size_spec = size_match.group(0) if size_match else None
 
-    # Remove parenthetical unit descriptions like "(500g)" or "(5-10 cm)"
-    name = re.sub(r'\([0-9\s\-\.\,]+(g|kg|pc|cm|gram).*\)', '', name, flags=re.IGNORECASE)
+        # Check for specific cuts in order of specificity
+        if "TENDERLOIN" in upper_text:
+            return "Beef Tenderloin", size_spec
+        if "STRIP" in upper_text and "LOIN" in upper_text:
+            return "Beef Striploin", size_spec
+        if "SIRLOIN" in upper_text:
+            return "Beef Sirloin", size_spec
+        if "SHORT RIB" in upper_text:
+            return "Beef Short Ribs", size_spec
+        if "RIB EYE" in upper_text:
+            return "Beef Rib Eye", size_spec
+        if "RIB SET" in upper_text:
+            return "Beef Rib Set", size_spec
+        if "RIB" in upper_text:
+            return "Beef Ribs", size_spec
+        if "RUMP" in upper_text:
+            return "Beef Rump", size_spec
+        if "ROUND" in upper_text:
+            return "Beef Round", size_spec
+        if "LOIN" in upper_text:
+            return "Beef Loin", size_spec
+        if "PLATE" in upper_text:
+            return "Beef Plate", size_spec
+        if "CHUCK" in upper_text:
+            return "Beef Chuck", size_spec
+        if "BRISKET" in upper_text:
+            return "Beef Brisket", size_spec
+        if "SHANK" in upper_text:
+            return "Beef Shank", size_spec
 
-    # Clean trailing/leading punctuation and extra spaces
-    name = name.strip(" )/-,.")
+        # Fallback
+        base_name = text
+        base_name = re.sub(r'\b(Large|Medium|Small|Lean|Boneless|with Bones)\b', '', base_name, flags=re.IGNORECASE)
+        base_name = base_name.strip(", ")
+        return base_name if len(base_name) > 2 else "Beef", size_spec
 
-    return " ".join(name.split()), unit_override
+
+
+    if "PORK" in upper_cat:
+        base_name = text
+        base_name = re.sub(r'\b(Local|Imported|Liempo|Kasim)\b', '', base_name, flags=re.IGNORECASE)
+        # Keep common name in parenthesis
+        if "BELLY" in upper_text:
+            return "Pork Belly (Liempo)", None
+        if "PICNIC SHOULDER" in upper_text:
+            return "Pork Picnic Shoulder (Kasim)", None
+        base_name = base_name.strip(", ")
+        return base_name, None
+
+    if "POULTRY" in upper_cat:
+        # Extract brand if present
+        brand = None
+        if "MAGNOLIA" in upper_text:
+            brand = "Magnolia"
+        elif "BOUNTY FRESH" in upper_text:
+            brand = "Bounty Fresh"
+        elif "UNBRANDED" in upper_text:
+            brand = "Unbranded"
+
+        # Remove brand from name
+        base_name = re.sub(r'\b(Magnolia|Bounty Fresh|Unbranded|Fresh|Fully Dressed)\b', '', text, flags=re.IGNORECASE)
+        base_name = base_name.strip(", ")
+
+        # Handle chicken egg specially
+        if "EGG" in upper_text:
+            return "Chicken Egg", "Medium (56-60 grams/pc)"
+
+        return base_name, brand
+
+    # -------------------------------------------------------------------------
+    # VEGETABLES
+    # -------------------------------------------------------------------------
+    if "VEGETABLE" in upper_cat:
+        # Extract size/bundle specification - IMPROVED PATTERN
+        # Matches: "Medium (8-10 cm diameter/bunch hd)", "510 gm - 1 kg/head", "8-10 pcs/kg", etc.
+        spec_match = re.search(
+            r'((?:Medium|Large|Small)?\s*\(?\d+-?\d*\s*(?:cm|gm?|g|pcs)(?:\s*[-/]\s*\d+\s*(?:kg|cm|g|gm))?\s*(?:diameter|bunch hd|head|pcs/kg)?[)]?)',
+            text,
+            re.IGNORECASE
+        )
+        spec = spec_match.group(1).strip() if spec_match else None
+
+        base_name = text
+        # Remove specifications from name - IMPROVED CLEANUP
+        base_name = re.sub(
+            r'(?:Medium|Large|Small)?\s*\(?\d+-?\d*\s*(?:cm|gm?|g|pcs)(?:\s*[-/]\s*\d+\s*(?:kg|cm|g|gm))?\s*(?:diameter|bunch hd|head|pcs/kg)?[)]?',
+            '',
+            base_name,
+            flags=re.IGNORECASE
+        )
+        base_name = re.sub(r'\b(Local|Imported|Native|Suprema Variety|Medium|Large|Small)\b', '', base_name, flags=re.IGNORECASE)
+
+        # Clean up leftover parentheses and commas
+        base_name = re.sub(r'\(\s*\)', '', base_name)
+        base_name = re.sub(r'\s+', ' ', base_name)
+
+        # Handle specific vegetables
+        if "BELL PEPPER" in upper_text:
+            if "GREEN" in upper_text:
+                return "Bell Pepper (Green)", spec
+            if "RED" in upper_text:
+                return "Bell Pepper (Red)", spec
+            return "Bell Pepper", spec
+
+        if "CABBAGE" in upper_text:
+            if "RARE BALL" in upper_text:
+                return "Cabbage (Rare Ball)", spec
+            if "SCORPIO" in upper_text:
+                return "Cabbage (Scorpio)", spec
+            if "WONDER BALL" in upper_text:
+                return "Cabbage (Wonder Ball)", spec
+            return "Cabbage", spec
+
+        if "LETTUCE" in upper_text:
+            if "GREEN ICE" in upper_text:
+                return "Lettuce (Green Ice)", spec
+            if "ICEBERG" in upper_text:
+                return "Lettuce (Iceberg)", spec
+            if "ROMAINE" in upper_text:
+                return "Lettuce (Romaine)", spec
+            return "Lettuce", spec
+
+        # Handle other specific vegetables
+        if "BROCCOLI" in upper_text:
+            return "Broccoli", spec
+
+        if "POTATO" in upper_text:
+            return "White Potato", spec
+        if "CAULIFLOWER" in upper_text:
+            return "Cauliflower", spec
+        if "CARROTS" in upper_text or "CARROT" in upper_text:
+            return "Carrots", spec
+        if "CELERY" in upper_text:
+            return "Celery", spec
+        if "CHAYOTE" in upper_text:
+            return "Chayote", spec
+        if "HABICHUELAS" in upper_text or "BAGUIO BEANS" in upper_text:
+            return "Baguio Beans", spec
+        if "PECHAY" in upper_text and "BAGUIO" in upper_text:
+            return "Pechay Baguio", spec
+
+        base_name = base_name.strip(", ()")
+        return base_name, spec
+
+    # -------------------------------------------------------------------------
+    # SPICES
+    # -------------------------------------------------------------------------
+    if "SPICE" in upper_cat:
+        if "CHILLI" in upper_text or "CHILI" in upper_text:
+            if "RED" in upper_text or "TINGALA" in upper_text:
+                return "Chilli Red", "Tingala"
+            if "GREEN" in upper_text:
+                return "Chilli Green", "Haba/Panigang"
+            if "TIGER" in upper_text:
+                return "Tiger Chillies", None
+
+        if "GARLIC" in upper_text:
+            if "NATIVE" in upper_text:
+                return "Garlic Native", None
+            return "Garlic", None
+
+        if "GINGER" in upper_text:
+            return "Ginger", "Medium (150-300 gm)"
+
+        if "ONION" in upper_text:
+            size_spec = None
+            if "MEDIUM" in upper_text:
+                size_spec = "Medium"
+            if "LARGE" in upper_text:
+                size_spec = "Large"
+
+            if "RED" in upper_text:
+                return "Red Onion", size_spec
+            if "WHITE" in upper_text:
+                return "White Onion", size_spec
+
+    # -------------------------------------------------------------------------
+    # FRUITS
+    # -------------------------------------------------------------------------
+    if "FRUIT" in upper_cat:
+        spec_match = re.search(r'(Ripe|Green|Solo|\d+-\d+\s*pcs/kg)', text, re.IGNORECASE)
+        spec = spec_match.group(1) if spec_match else None
+
+        base_name = text
+        base_name = re.sub(r'\b(Ripe|Green|Solo|\d+-\d+\s*pcs/kg)\b', '', base_name, flags=re.IGNORECASE)
+
+        if "BANANA" in upper_text:
+            if "LAKATAN" in upper_text:
+                return "Banana (Lakatan)", "8-10 pcs/kg"
+            if "LATUNDAN" in upper_text:
+                return "Banana (Latundan)", "10-12 pcs/kg"
+            if "SABA" in upper_text:
+                return "Banana (Saba)", None
+
+        if "MANGO" in upper_text and "CARABAO" in upper_text:
+            return "Mango (Carabao)", "Ripe, 3-4 pcs/kg"
+
+        if "PAPAYA" in upper_text:
+            return "Papaya", "Solo, Ripe, 2-3 pcs/kg"
+
+        base_name = base_name.strip(", ()")
+        return base_name, spec
+
+    # -------------------------------------------------------------------------
+    # OTHER BASIC COMMODITIES
+    # -------------------------------------------------------------------------
+    if "BASIC" in upper_cat:
+        # Cooking Oil
+        if "COOKING OIL" in upper_text:
+            brand_type = "Palm"  # default
+
+            if "COCONUT" in upper_text:
+                brand_type = "Coconut"
+            elif "MINOLA" in upper_text:
+                brand_type = "Minola"
+            elif "SPRING" in upper_text:
+                brand_type = "Spring"
+            elif "JOLLY" in upper_text or "PALM OLEIN" in upper_text:
+                brand_type = "Palm Olein (Jolly)"
+
+            # Volume is extracted separately
+            return f"Cooking Oil ({brand_type})", None
+
+        # Sugar
+        if "SUGAR" in upper_text:
+            if "REFINED" in upper_text:
+                return "Sugar (Refined)", None
+            if "WASHED" in upper_text:
+                return "Sugar (Washed)", None
+            if "BROWN" in upper_text:
+                return "Sugar (Brown)", None
+
+        # Salt
+        if "SALT" in upper_text:
+            if "IODIZED" in upper_text:
+                return "Salt (Iodized)", None
+            if "ROCK" in upper_text:
+                return "Salt (Rock)", None
+
+    # -------------------------------------------------------------------------
+    # FALLBACK: Clean generic commodities
+    # -------------------------------------------------------------------------
+    base_name = text
+    base_name = re.sub(r'\b(Local|Imported|Fresh|Frozen|Chilled|Whole Round|Native)\b', '', base_name, flags=re.IGNORECASE)
+    base_name = re.sub(r'\d+[-]?\d*\s*(?:pcs?/?kg|grams?|cm|ml|L)', '', base_name, flags=re.IGNORECASE)
+    base_name = base_name.strip(", ()")
+
+    return base_name, None
 
 # ==============================================================================
 # MAIN PARSING FUNCTION
@@ -289,32 +493,19 @@ def normalize_commodity_name(full_text: str, category: str) -> tuple[str, Option
 
 def parse_text_to_json(raw_text: str) -> Dict[str, Any]:
     """
-    Converts raw PDF text into structured price data
-
-    This is the core parser that:
-    1. Extracts covered markets list
-    2. Detects category headers
-    3. Uses line buffering to handle multi-line commodity names
-    4. Matches prices to their commodities
-    5. Normalizes all data into clean JSON structure
-
-    Args:
-        raw_text: Complete PDF text content
-
-    Returns:
-        Dictionary with 'covered_markets' and 'price_data' keys
+    Improved parser with better multi-line handling
     """
     lines = raw_text.split('\n')
     price_data_list = []
     current_category = "UNKNOWN"
     market_list = []
 
-    # Multi-line buffering system
-    # Stores lines that are part of a commodity name but haven't reached price yet
-    name_buffer = []
+    # Buffer system for multi-line commodities
+    commodity_buffer = []
+    specification_buffer = []
 
     # -------------------------------------------------------------------------
-    # Step 1: Extract Covered Markets
+    # Extract Covered Markets
     # -------------------------------------------------------------------------
     market_match = re.search(
         r"(?:d\)|Covered markets:)\s*(1\..+?)(?:Page|\Z)",
@@ -326,79 +517,192 @@ def parse_text_to_json(raw_text: str) -> Dict[str, Any]:
         raw_block = market_match.group(1)
         raw_markets = re.split(r'\s*\d+\.\s*', raw_block)
         market_list = [re.sub(r'[\n\r]', ' ', m).strip() for m in raw_markets if len(m) > 3]
-        market_list = list(dict.fromkeys(market_list))  # Remove duplicates
+        market_list = list(dict.fromkeys(market_list))
 
     # -------------------------------------------------------------------------
-    # Step 2: Process Each Line
+    # Process Lines
     # -------------------------------------------------------------------------
-    for line in lines:
-        line = line.strip()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
         if not line:
+            i += 1
             continue
 
-        # Check if line is a category header
+        # Check for category header
         is_category = False
         for cat in KNOWN_CATEGORIES:
             if cat in line.upper():
                 current_category = cat
                 is_category = True
-                name_buffer = []  # Reset buffer when entering new category
+                commodity_buffer = []
+                specification_buffer = []
                 break
 
         if is_category:
+            i += 1
             continue
 
-        # Skip known header/footer lines
-        if any(x in line for x in ["Source:", "Note:", "Prevailing", "Retail Price",
-                                   "Page", "Department of", "COMMODITY"]):
+        # Skip headers/footers - IMPROVED DETECTION
+        # Skip page indicators
+        if re.search(r'Page\s+\d+\s+of\s+\d+', line, re.IGNORECASE):
+            i += 1
+            continue
+        
+        header_keywords = ["Source:", "Note:", "Department"]
+        
+        # Count how many header keywords are in the line
+        header_count = sum(1 for kw in header_keywords if kw in line)
+        
+        # Skip if it's a header line (multiple keywords) or contains PREVAILING/COMMODITY
+        if header_count >= 1 or "PREVAILING" in line or "COMMODITY" in line or "SPECIFICATION" in line or "PRICE PER UNIT" in line:
+            i += 1
             continue
 
-        # Only process lines within a known category
-        if current_category != "UNKNOWN":
+        if current_category == "UNKNOWN":
+            i += 1
+            continue
 
-            # Look for price pattern at end of line
-            price_match = re.search(r'(?:^|\s)(\d{1,3}(?:,\d{3})*\.\d{2}|\$n/a\$|-)\s*$', line)
+        # Look for price at end of line
+        price_match = re.search(r'\s+(\d{1,3}(?:,\d{3})*\.\d{2}|n/a)\s*$', line)
 
-            if price_match:
-                # =====================================================
-                # PRICE FOUND - Process Complete Row
-                # =====================================================
+        if price_match:
+            # PRICE FOUND - Process complete row
+            price_str = price_match.group(1).replace(',', '')
+            line_content = line[:price_match.start()].strip()
 
-                price_str = price_match.group(1).replace(',', '')
-                line_content = line[:price_match.start()].strip()
+            # =====================================================
+            # SKIP PAGE INDICATORS
+            # =====================================================
+            if re.search(r'Page\s+\d+\s+of\s+\d+', line_content, re.IGNORECASE):
+                commodity_buffer = []
+                specification_buffer = []
+                i += 1
+                continue
 
-                # Combine buffered lines with current line to get FULL commodity name
-                full_raw_text = " ".join(name_buffer + [line_content])
+            # =====================================================
+            # CHECK IF THIS IS A HEADER ROW - EARLY SKIP
+            # =====================================================
+            # Count header keywords in the line
+            header_keywords = ["PREVAILING", "RETAIL", "PRICE", "COMMODITY", "SPECIFICATION", "UNIT", "P/UNIT"]
+            header_keyword_count = sum(1 for kw in header_keywords if kw in line_content.upper())
 
-                # Normalize the complete text
-                clean_name, unit_override = normalize_commodity_name(full_raw_text, current_category)
+            # If 2+ header keywords found, OR contains "RETAIL PRICE PER", this is a header row - SKIP
+            if header_keyword_count >= 2 or "RETAIL PRICE PER" in line_content.upper() or "PREVAILING RETAIL" in line_content.upper():
+                commodity_buffer = []
+                specification_buffer = []
+                i += 1
+                continue
 
-                # Determine origin (Local vs Imported)
-                origin = "Imported" if "IMPORTED" in full_raw_text.upper() or "IMPORTED" in current_category else "Local"
+            # =====================================================
+            # AGGRESSIVE HEADER PHRASE REMOVAL
+            # =====================================================
+            # Remove all variations of the header phrase
+            original_content = line_content
+            
+            # Remove "RETAIL PRICE PER" (with or without UNIT, with or without PREVAILING)
+            line_content = re.sub(
+                r'(?:PREVAILING\s+)?(?:RETAIL\s+)?PRICE\s+PER(?:\s+UNIT)?',
+                '',
+                line_content,
+                flags=re.IGNORECASE
+            ).strip()
 
-                # Determine unit (use override if specified, otherwise use defaults)
-                unit = unit_override
-                if not unit:
-                    if "egg" in clean_name.lower():
-                        unit = "pc"
-                    elif "cooking oil" in current_category.lower():
-                        unit = "L"
-                    else:
-                        unit = "kg"
+            # If nothing was removed and line still has too many header keywords, skip it
+            if line_content == original_content and header_keyword_count >= 1:
+                commodity_buffer = []
+                specification_buffer = []
+                i += 1
+                continue
 
-                # Parse price value
-                final_price = None
-                try:
-                    if price_str not in ['-', '$n/a$']:
-                        final_price = float(price_str)
-                except:
-                    pass
+            # Remove remaining header keywords one by one
+            line_content = re.sub(
+                r'\b(PREVAILING|RETAIL|PRICE|PER|UNIT|COMMODITY|SPECIFICATION|PAGE|DEPARTMENT|COVERED|MARKETS|OF|P/UNIT)\b\s*',
+                '',
+                line_content,
+                flags=re.IGNORECASE
+            ).strip()
 
-                # Clean category name (remove LOCAL/IMPORTED prefix)
-                clean_cat = current_category.replace("IMPORTED ", "").replace("LOCAL ", "").strip()
+            # Clean up multiple spaces
+            line_content = re.sub(r'\s+', ' ', line_content).strip()
 
-                # Save valid row
-                if clean_name and len(clean_name) > 2 and clean_name.lower() != "or":
+            # If line_content is empty or only header remnants, skip
+            if not line_content or len(line_content) < 3:
+                commodity_buffer = []
+                specification_buffer = []
+                i += 1
+                continue
+
+            # Final validation - if line is still mostly garbage, skip
+            garbage_words = ["RETAIL", "PRICE", "UNIT", "COMMODITY", "SPECIFICATION", "PREVAILING", "PAGE"]
+            if all(word in line_content.upper() for word in garbage_words[:2]):
+                commodity_buffer = []
+                specification_buffer = []
+                i += 1
+                continue
+
+            # =====================================================
+            # EXTRACT ORIGIN FROM LINE CONTENT
+            # =====================================================
+            origin = "Local"
+            if "IMPORTED" in line_content.upper() or "IMPORTED" in current_category:
+                origin = "Imported"
+
+            # Remove origin keywords from line_content
+            line_content_clean = re.sub(
+                r',?\s*\b(Local|Imported)\b',
+                '',
+                line_content,
+                flags=re.IGNORECASE
+            ).strip()
+
+            # =====================================================
+            # BUILD FULL COMMODITY TEXT
+            # =====================================================
+            if specification_buffer:
+                full_spec = " ".join(specification_buffer + [line_content_clean])
+            else:
+                full_spec = line_content_clean
+
+            full_commodity = " ".join(commodity_buffer) if commodity_buffer else ""
+
+            # If both buffers are empty, use line_content_clean as commodity
+            if not full_commodity:
+                full_commodity = line_content_clean
+                full_spec = ""
+
+            # =====================================================
+            # NORMALIZE COMMODITY NAME
+            # =====================================================
+            clean_name, specification = normalize_commodity_name(
+                full_commodity,
+                current_category
+            )
+
+            # Extract unit
+            unit = extract_unit_from_spec(full_spec if full_spec else full_commodity, clean_name)
+
+            # Parse price
+            final_price = None
+            try:
+                if price_str not in ['n/a', '-']:
+                    final_price = float(price_str)
+            except:
+                pass
+
+            # Clean category
+            clean_cat = current_category.replace("IMPORTED ", "").replace("LOCAL ", "").strip()
+
+            # Save row - SKIP if price is n/a or commodity name is invalid
+            if clean_name and len(clean_name) > 2 and final_price is not None:
+                # Final blacklist check - skip known header remnants
+                blacklist = ["PREVAILING", "PRICE", "UNIT", "COMMODITY", "SPECIFICATION", "PAGE", "RETAIL", "RETAIL PRICE PER", "PREVAILING RETAIL", "PRICE PER UNIT"]
+
+                # Also check if clean_name contains multiple header keywords (likely header text)
+                header_keywords_in_name = sum(1 for kw in ["RETAIL", "PRICE", "PER", "UNIT", "PREVAILING"] if kw in clean_name.upper())
+
+                if clean_name.upper() not in blacklist and header_keywords_in_name < 2:
                     price_data_list.append(PriceRow(
                         category=clean_cat,
                         commodity=clean_name,
@@ -407,27 +711,27 @@ def parse_text_to_json(raw_text: str) -> Dict[str, Any]:
                         price=final_price
                     ))
 
-                # Clear buffer after successfully processing row
-                name_buffer = []
+            # Reset buffers
+            commodity_buffer = []
+            specification_buffer = []
 
+        else:
+            # NO PRICE - Check if this is commodity or specification
+            # Heuristic: If previous line had no price and current line has no price,
+            # treat first line as commodity, second as specification
+
+            if not commodity_buffer:
+                commodity_buffer.append(line)
             else:
-                # =====================================================
-                # NO PRICE FOUND - Add to Buffer
-                # =====================================================
-                # This handles cases where commodity name spans multiple lines
-                # Example: Line 1: "Cooking Oil (Palm..."
-                #          Line 2: "Olein) 1 Liter 145.50"
+                specification_buffer.append(line)
 
-                if len(line) > 1:
-                    name_buffer.append(line)
+        i += 1
 
-    # -------------------------------------------------------------------------
-    # Step 3: Return Structured Data
-    # -------------------------------------------------------------------------
     return {
         "covered_markets": market_list,
         "price_data": price_data_list
     }
+
 
 # ==============================================================================
 # API ENDPOINTS
