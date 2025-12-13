@@ -12,8 +12,7 @@
 # ==============================================================================
 
 import logging
-from fastapi import FastAPI, HTTPException, Depends, File, UploadFile
-from fastapi.security import APIKeyHeader
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from pydantic import BaseModel, Field
 import httpx
 from bs4 import BeautifulSoup
@@ -24,14 +23,16 @@ import re
 from urllib.parse import urljoin
 from typing import Optional, Dict, Any, List
 
+
+app = FastAPI(title="DA Price Index Scraper (RabbitMQ Ready)", version="7.0.0")
+
+
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
 
 BASE_URL = "https://www.da.gov.ph"
 TARGET_URL = "https://www.da.gov.ph/price-monitoring/"
-SHARED_SECRET = "Jeremiah_Madronio_API_Key_82219800JeremiahPux83147"
-
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
 }
@@ -60,17 +61,8 @@ class ScrapeRequest(BaseModel):
     """Request body for scraping endpoint"""
     target_url: str = Field(TARGET_URL)
 
-# ==============================================================================
-# APP INITIALIZATION
-# ==============================================================================
 
-app = FastAPI(title="DA Price Index Scraper (Improved)", version="6.0.0")
-api_key_header = APIKeyHeader(name="X-Internal-Secret", auto_error=False)
 
-def verify_internal_access(x_internal_secret: str = Depends(api_key_header)):
-    if x_internal_secret == SHARED_SECRET:
-        return True
-    raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ==============================================================================
 # CATEGORY DEFINITIONS
@@ -737,7 +729,7 @@ def parse_text_to_json(raw_text: str) -> Dict[str, Any]:
 # API ENDPOINTS
 # ==============================================================================
 
-@app.post("/api/scrape-new-pdf", response_model=PdfResponseStructured, dependencies=[Depends(verify_internal_access)])
+@app.post("/api/scrape-new-pdf", response_model=PdfResponseStructured)
 async def scrape_new_pdf_data(request: ScrapeRequest):
     """
     Scrapes the newest Daily Price Index PDF from DA website
@@ -749,7 +741,7 @@ async def scrape_new_pdf_data(request: ScrapeRequest):
     4. Downloads and parses that PDF
     5. Returns structured price data
 
-    Requires: X-Internal-Secret header for authentication
+    Note: API key authentication removed - use RabbitMQ for secure communication
     """
     async with httpx.AsyncClient(timeout=30) as client:
         # Fetch price monitoring page
@@ -800,7 +792,7 @@ async def scrape_new_pdf_data(request: ScrapeRequest):
             price_data=data['price_data']
         )
 
-@app.post("/api/extract-manual", response_model=PdfResponseStructured, dependencies=[Depends(verify_internal_access)])
+@app.post("/api/extract-manual", response_model=PdfResponseStructured)
 async def extract_manual_pdf(file: UploadFile = File(...)):
     """
     Manually upload and parse a DPI PDF file
@@ -810,7 +802,7 @@ async def extract_manual_pdf(file: UploadFile = File(...)):
     - Testing with specific documents
     - Extracting data from downloaded files
 
-    Requires: X-Internal-Secret header for authentication
+    Note: API key authentication removed - use RabbitMQ for secure communication
     """
     if file.content_type != 'application/pdf':
         raise HTTPException(400, "File must be PDF")
@@ -833,7 +825,61 @@ async def extract_manual_pdf(file: UploadFile = File(...)):
 @app.get("/")
 def root():
     """Health check endpoint"""
-    return {"message": "Smart DA Price Scraper is Running"}
+    return {"message": "Smart DA Price Scraper is Running (RabbitMQ Ready)"}
+
+
+async def run_standalone_scraper():
+    """
+    Independent scraper function for RabbitMQ Worker
+    """
+    print(" [LOGIC] Starting standalone scrape...")
+
+    # 1. Setup Client
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            # Fetch Page
+            resp = await client.get(TARGET_URL, headers=HEADERS)
+            resp.raise_for_status()
+
+            # Find PDF Link
+            soup = BeautifulSoup(resp.text, 'lxml')
+            links = soup.find_all('a', href=re.compile(r'(Daily-Price-Index|DPI).*?\.pdf$', re.IGNORECASE))
+
+            if not links:
+                print(" [ERROR] No PDF links found.")
+                return None
+
+            # Get Newest
+            newest_link = None
+            latest_date = datetime.min
+            for link in links:
+                href = link.get('href')
+                f_name = href.split('/')[-1]
+                f_date = parse_date_from_filename(f_name)
+                if f_date and f_date > latest_date:
+                    latest_date = f_date
+                    newest_link = {
+                        'href': urljoin(BASE_URL, href),
+                        'date_str': f_date.strftime("%Y-%m-%d")
+                    }
+
+            if not newest_link:
+                return None
+
+            # Download & Parse
+            print(f" [LOGIC] Downloading: {newest_link['href']}")
+            pdf_resp = await client.get(newest_link['href'], headers=HEADERS)
+            content = extract_pdf_content(pdf_resp.content)
+            data = parse_text_to_json(content)
+
+            return {
+                "date": newest_link['date_str'],
+                "data": data
+            }
+
+        except Exception as e:
+            print(f" [ERROR] Scraping failed: {e}")
+            return None
 
 
 
