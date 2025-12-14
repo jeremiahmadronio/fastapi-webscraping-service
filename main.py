@@ -827,18 +827,17 @@ def root():
     """Health check endpoint"""
     return {"message": "Smart DA Price Scraper is Running (RabbitMQ Ready)"}
 
-
-async def run_standalone_scraper():
+async def run_standalone_scraper(target_url):
     """
     Independent scraper function for RabbitMQ Worker
     """
-    print(" [LOGIC] Starting standalone scrape...")
+    print(f" [LOGIC] Starting standalone scrape for: {target_url}")
 
-    # 1. Setup Client
+
     async with httpx.AsyncClient(timeout=60) as client:
         try:
-            # Fetch Page
-            resp = await client.get(TARGET_URL, headers=HEADERS)
+
+            resp = await client.get(target_url, headers=HEADERS)
             resp.raise_for_status()
 
             # Find PDF Link
@@ -856,6 +855,8 @@ async def run_standalone_scraper():
                 href = link.get('href')
                 f_name = href.split('/')[-1]
                 f_date = parse_date_from_filename(f_name)
+
+
                 if f_date and f_date > latest_date:
                     latest_date = f_date
                     newest_link = {
@@ -870,18 +871,24 @@ async def run_standalone_scraper():
             print(f" [LOGIC] Downloading: {newest_link['href']}")
             pdf_resp = await client.get(newest_link['href'], headers=HEADERS)
             content = extract_pdf_content(pdf_resp.content)
+
+            # Parse content
             data = parse_text_to_json(content)
 
+
             return {
-                "date": newest_link['date_str'],
-                "data": data
+                "data": {
+                    "price_data": data['price_data'],
+                    "covered_markets": data['covered_markets'],
+                    "date_processed": newest_link['date_str']
+                }
             }
 
         except Exception as e:
             print(f" [ERROR] Scraping failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
-
-
 
 # ==============================================================================
 # RAILWAY DEPLOYMENT CONFIGURATION
@@ -894,5 +901,5 @@ if __name__ == "__main__":
     # Get port from environment variable (Railway sets this automatically)
     port = int(os.environ.get("PORT", 8000))
 
-    # Run the FastAPI app
+   
     uvicorn.run(app, host="0.0.0.0", port=port)
