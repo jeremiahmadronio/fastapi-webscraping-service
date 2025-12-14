@@ -15,6 +15,7 @@ import logging
 from fastapi import FastAPI, HTTPException, File, UploadFile
 from pydantic import BaseModel, Field
 import httpx
+import threading
 from bs4 import BeautifulSoup
 from io import BytesIO
 from pypdf import PdfReader
@@ -62,7 +63,18 @@ class ScrapeRequest(BaseModel):
     target_url: str = Field(TARGET_URL)
 
 
+@app.on_event("startup")
+def startup_event():
+    """
+    This function runs automatically when the server starts.
+    It spins up the RabbitMQ Worker in a separate background thread.
+    """
+    print(" [SYSTEM] Starting RabbitMQ Worker in background thread...")
+    from worker import start_worker
+    worker_thread = threading.Thread(target=start_worker, daemon=True)
+    worker_thread.start()
 
+    print(" [SYSTEM] Worker thread started!")
 
 # ==============================================================================
 # CATEGORY DEFINITIONS
