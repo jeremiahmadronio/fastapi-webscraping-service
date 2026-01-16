@@ -1,19 +1,9 @@
 """
-BudgetWise Scraper Microservice (Worker) - FIXED SERIALIZATION
+BudgetWise Scraper Microservice (Worker)
 ============================================================
-
 Description:
-    Background worker that listens for scraping tasks via RabbitMQ.
+    Background worker that listens for scraping tasks AND manual uploads via RabbitMQ.
     Executes scraping logic and returns JSON-serializable data to Java.
-
-Flow:
-    1. Listen to 'scrape_request_queue'.
-    2. Run scraper (main.py).
-    3. CONVERT Pydantic objects to Dictionaries (Critical Step).
-    4. Send JSON result to 'scraped_data_queue'.
-
-Author: Jeremiah (BudgetWise Team)
-Date: Dec 2025
 """
 
 import pika
@@ -22,10 +12,12 @@ import asyncio
 import os
 import sys
 import traceback
+import base64
 from datetime import date
 
-# Import the core scraping logic
-from main import run_standalone_scraper
+# Import the core scraping logic from main.py
+# Ensure process_manual_pdf_bytes is defined in main.py
+from main import run_standalone_scraper, process_manual_pdf_bytes
 
 # ==============================================================================
 # CONFIGURATION
@@ -35,8 +27,8 @@ from main import run_standalone_scraper
 CLOUDAMQP_URL = 'amqps://acyxmzrb:tPkTAhWMQ0ju6dxyQ6f0xdiijpfPspKd@codfish.rmq.cloudamqp.com/acyxmzrb'
 
 # Queue Definitions (Must match Java RabbitMQConfig)
-REQUEST_QUEUE = 'scrape_request_queue'  # INPUT: Commands from Java
-OUTPUT_QUEUE = 'scraped_data_queue'     # OUTPUT: Results to Java
+REQUEST_QUEUE = 'scrape_request_queue'  # INPUT
+OUTPUT_QUEUE = 'scraped_data_queue'     # OUTPUT
 
 def start_worker():
     """
@@ -60,35 +52,69 @@ def start_worker():
         # MESSAGE PROCESSOR (CALLBACK)
         # ======================================================================
         def callback(ch, method, properties, body):
-            print(f"\n [x] Command Received: {body.decode()}")
+            print(f"\n [x] Command Received")
 
             try:
                 # A. Parse Request
-                request_data = json.loads(body.decode())
-                target_url = request_data.get('target_url')
-
-                if not target_url:
-                    print(" [!] Error: 'target_url' missing.")
+                try:
+                    request_data = json.loads(body.decode())
+                except json.JSONDecodeError:
+                    print(" [!] Error: Invalid JSON Format")
                     ch.basic_ack(delivery_tag=method.delivery_tag)
                     return
 
-                print(f" [x] Running scraper logic for: {target_url}...")
+                result = None
 
-                # B. Execute Scraper
-                result = asyncio.run(run_standalone_scraper(target_url))
+                # --- LOGIC BRANCHING ---
+
+                # CASE 1: MANUAL UPLOAD (Check if file_content exists)
+                if 'file_content' in request_data and request_data['file_content']:
+                    print(" [x] Mode: MANUAL PDF UPLOAD detected.")
+
+                    try:
+                        # Decode Base64 string back to bytes
+                        pdf_b64 = request_data['file_content']
+                        filename = request_data.get('filename', 'manual_upload.pdf')
+
+                        pdf_bytes = base64.b64decode(pdf_b64)
+
+                        # Run logic directly (Synchronous)
+                        result = process_manual_pdf_bytes(pdf_bytes, filename)
+                    except Exception as e:
+                        print(f" [!] Base64 Decode/Process Error: {e}")
+                        traceback.print_exc()
+
+                # CASE 2: WEB SCRAPING (Check if target_url exists)
+                elif 'target_url' in request_data and request_data['target_url']:
+                    target_url = request_data.get('target_url')
+                    print(f" [x] Mode: WEB SCRAPING target: {target_url}")
+                    # Run logic (Asynchronous)
+                    result = asyncio.run(run_standalone_scraper(target_url))
+
+                # CASE 3: INVALID PAYLOAD
+                else:
+                    print(" [!] Error: Invalid Payload. Missing 'target_url' or 'file_content'.")
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    return
+
+                # --- PROCESS RESULT ---
 
                 # C. Validate & Convert Data
                 if result and result.get('data'):
                     data = result['data']
 
-                    # ---------------------------------------------------------
-                    # 🔥 CRITICAL FIX: CONVERT OBJECTS TO DICTIONARIES
-                    # ---------------------------------------------------------
+                    # Fix Serialization (Pydantic to Dict)
                     raw_rows = data.get('price_data', [])
 
-                    # Convert each Pydantic 'PriceRow' object to a pure Dictionary
-                    # This prevents "TypeError: Object of type PriceRow is not JSON serializable"
-                    price_data = [item.model_dump() for item in raw_rows]
+                    # Robust checking for Pydantic objects vs Dicts
+                    price_data = []
+                    for item in raw_rows:
+                        if hasattr(item, 'model_dump'):
+                            price_data.append(item.model_dump())
+                        elif hasattr(item, 'dict'):
+                            price_data.append(item.dict())
+                        else:
+                            price_data.append(item)
 
                     covered_markets = data.get('covered_markets', [])
                     date_processed = data.get('date_processed', str(date.today()))
@@ -99,9 +125,10 @@ def start_worker():
                     payload = {
                         "status": "SUCCESS",
                         "date_processed": date_processed,
-                        "original_url": target_url,
+                        "original_url": request_data.get('filename') if 'filename' in request_data else request_data.get('target_url'),
                         "covered_markets": covered_markets,
-                        "price_data": price_data  # Now pure JSON friendly
+                        "price_data": price_data,
+                        "source_type": "MANUAL" if 'file_content' in request_data else "SCRAPED"
                     }
 
                     print(f" [x] Success! Extracted {item_count} items from {len(covered_markets)} markets.")
@@ -112,17 +139,15 @@ def start_worker():
                         routing_key=OUTPUT_QUEUE,
                         body=json.dumps(payload),
                         properties=pika.BasicProperties(
-                            delivery_mode=2,  # Persistent message
+                            delivery_mode=2,
                             content_type='application/json'
                         ))
-
                     print(f" [x] Data sent to '{OUTPUT_QUEUE}' successfully.")
 
                 else:
-                    print(" [!] Warning: Scraper returned empty data.")
+                    print(" [!] Warning: Scraper/Parser returned empty data or failed.")
 
             except Exception as e:
-                # F. Error Handling
                 print(f" [!] Error during processing: {e}")
                 traceback.print_exc()
 

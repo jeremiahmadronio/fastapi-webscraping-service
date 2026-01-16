@@ -902,6 +902,39 @@ async def run_standalone_scraper(target_url):
             traceback.print_exc()
             return None
 
+
+
+def process_manual_pdf_bytes(pdf_bytes: bytes, filename: str):
+    """
+    Parses a manually uploaded PDF byte stream directly.
+    """
+    try:
+        print(f" [LOGIC] Processing manual PDF: {filename}")
+
+        # 1. Extract Text from Bytes (Gamit yung existing helper mo)
+        content = extract_pdf_content(pdf_bytes)
+
+        # 2. Parse Text to JSON (Gamit yung existing parser mo)
+        data = parse_text_to_json(content)
+
+        # 3. Handle Date (Try to get from filename, else today)
+        date_obj = parse_date_from_filename(filename)
+        date_str = date_obj.strftime("%Y-%m-%d") if date_obj else str(date.today())
+
+        return {
+            "data": {
+                "price_data": data['price_data'],
+                "covered_markets": data['covered_markets'],
+                "date_processed": date_str
+            }
+        }
+    except Exception as e:
+        print(f" [ERROR] Manual parsing failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 # ==============================================================================
 # RAILWAY DEPLOYMENT CONFIGURATION
 # ==============================================================================
